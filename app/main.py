@@ -181,23 +181,58 @@ def _resize_for_model(image: Image.Image) -> Image.Image:
 
 
 def _extract_json(text: str) -> Any:
+    """Extract the most useful JSON payload, including when the model emits thought text or multiple code fences.
+
+    Prefer the valid payload with the most candidate findings rather than blindly taking the first JSON object,
+    which may be an empty draft followed by a better final JSON block.
+    """
     text = text.strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
-    text = re.sub(r"\s*```$", "", text)
+    decoder = json.JSONDecoder()
+    candidates: list[Any] = []
+
+    # First inspect complete fenced blocks, in case the response contains multiple JSON examples.
+    for match in re.finditer(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.I | re.S):
+        block = match.group(1).strip()
+        try:
+            candidates.append(json.loads(block))
+        except json.JSONDecodeError:
+            pass
+
+    # Try the entire response, then scan for every decodable JSON object/array in surrounding prose.
     try:
-        return json.loads(text)
+        candidates.append(json.loads(text))
     except json.JSONDecodeError:
         pass
-    # Attempt to locate the first JSON object or array in surrounding prose.
-    decoder = json.JSONDecoder()
     for i, ch in enumerate(text):
-        if ch in "{[":
-            try:
-                obj, _ = decoder.raw_decode(text[i:])
-                return obj
-            except json.JSONDecodeError:
-                continue
-    raise ValueError("Model output did not contain parseable JSON.")
+        if ch not in "{[":
+            continue
+        try:
+            obj, _ = decoder.raw_decode(text[i:])
+            candidates.append(obj)
+        except json.JSONDecodeError:
+            continue
+
+    if not candidates:
+        raise ValueError("Model output did not contain parseable JSON.")
+
+    def score(obj: Any) -> tuple[int, int, int]:
+        if isinstance(obj, list):
+            entries = obj
+        elif isinstance(obj, dict):
+            entries = obj.get("findings", obj.get("detections", obj.get("objects", [])))
+            if not entries and any(k in obj for k in ("box", "bbox", "bounding_box")):
+                entries = [obj]
+        else:
+            entries = []
+        valid_box_count = 0
+        if isinstance(entries, list):
+            for entry in entries:
+                if isinstance(entry, dict) and any(k in entry for k in ("box", "bbox", "bounding_box", "coordinates")):
+                    valid_box_count += 1
+        has_findings_schema = int(isinstance(obj, dict) and any(k in obj for k in ("findings", "detections", "objects")))
+        return (valid_box_count, has_findings_schema, len(entries) if isinstance(entries, list) else 0)
+
+    return max(candidates, key=score)
 
 
 def _to_pixel_box(value: Any, width: int, height: int) -> Box | None:
@@ -504,8 +539,9 @@ async def localize_series(
 You are an experimental medical-image review assistant. This is research output only, not a diagnosis.
 Case context: this image is one ordered slice from a larger imaging series. Analyze this slice only; do not assume neighboring slices were seen.
 Task: {target}
-Return ONLY valid JSON with schema: {{"findings":[{{"label":"short description of a visually supported possible finding","kind":"possible_finding | uncertain","box":[x_min,y_min,x_max,y_max],"notes":"brief uncertainty/visual rationale"}}],"limitations":["..."]}}.
-Coordinates must be normalized to the image you see from 0 to 1000 inclusive, in x_min,y_min,x_max,y_max order, origin top-left. Do not invent findings or boxes. Do not claim confirmed disease. If no visible candidate can be localized, return an empty findings list. Do not include patient identifiers.
+Inspect the image carefully for any visually apparent candidate abnormality. If you see a plausible candidate but are not certain, you may return it as kind="uncertain" and clearly describe the uncertainty; do not require diagnostic certainty to localize a visible feature. Do not invent a finding merely to fill the schema, and do not create a box for a feature you cannot locate.
+Return ONLY one final valid JSON object with schema: {{"findings":[{{"label":"short description of a visually supported possible finding","kind":"possible_finding or uncertain","box":[x_min,y_min,x_max,y_max],"notes":"brief uncertainty/visual rationale"}}],"limitations":["..."]}}. Do not include analysis, drafts, or multiple JSON examples.
+Coordinates must be normalized to the image you see from 0 to 1000 inclusive, in x_min,y_min,x_max,y_max order, origin top-left. Each box must tightly enclose the visible candidate. Do not claim confirmed disease. Return an empty findings list only when you cannot identify any visually supported candidate in this slice. Do not include patient identifiers.
 """
             raw_text = _run_inference(model_image, prompt)
             parsed = _extract_json(raw_text)
